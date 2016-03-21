@@ -70,11 +70,31 @@ abstract class Job
      */
     const STATE_INCOMPLETE = 'incomplete';
 
+    /**
+     * State if an error occurs in the runner command.
+     *
+     * The runner command is the command that actually launches the individual
+     * jobs. If instead an error occurs in the job command, this will result
+     * in a state of FAILED.
+     */
+    const DEFAULT_QUEUE = 'default';
+    const MAX_QUEUE_LENGTH = 50;
+
+    const PRIORITY_LOW = -5;
+    const PRIORITY_DEFAULT = 0;
+    const PRIORITY_HIGH = 5;
+
     /** @ORM\Id @ORM\GeneratedValue(strategy = "AUTO") @ORM\Column(type = "bigint", options = {"unsigned": true}) */
     protected $id;
 
-    /** @ORM\Column(type = "string") */
+    /** @ORM\Column(type = "string", length = 15) */
     protected $state;
+
+    /** @ORM\Column(type = "string", length = Job::MAX_QUEUE_LENGTH) */
+    protected $queue;
+
+    /** @ORM\Column(type = "smallint") */
+    private $priority = 0;
 
     /** @ORM\Column(type = "datetime", name="createdAt") */
     protected $createdAt;
@@ -84,6 +104,9 @@ abstract class Job
 
     /** @ORM\Column(type = "datetime", name="checkedAt", nullable = true) */
     protected $checkedAt;
+
+    /** @ORM\Column(type = "string", name="workerName", length = 50, nullable = true) */
+    protected $workerName;
 
     /** @ORM\Column(type = "datetime", name="executeAfter", nullable = true) */
     protected $executeAfter;
@@ -96,6 +119,15 @@ abstract class Job
 
     /** @ORM\Column(type = "json_array") */
     protected $args;
+
+    /**
+     * @ORM\ManyToMany(targetEntity = "Job", fetch = "EAGER")
+     * @ORM\JoinTable(name="jms_job_dependencies",
+     *     joinColumns = { @ORM\JoinColumn(name = "source_job_id", referencedColumnName = "id") },
+     *     inverseJoinColumns = { @ORM\JoinColumn(name = "dest_job_id", referencedColumnName = "id")}
+     * )
+     */
+    protected $dependencies;
 
     /** @ORM\Column(type = "text", nullable = true) */
     protected $output;
@@ -112,6 +144,15 @@ abstract class Job
     /** @ORM\Column(type = "smallint", name="maxRetries", options = {"unsigned": true}) */
     protected $maxRetries = 0;
 
+    /**
+     * @ORM\ManyToOne(targetEntity = "Job", inversedBy = "retryJobs")
+     * @ORM\JoinColumn(name="originalJob_id", referencedColumnName="id")
+     */
+    protected $originalJob;
+
+    /** @ORM\OneToMany(targetEntity = "Job", mappedBy = "originalJob", cascade = {"persist", "remove", "detach", "refresh"}) */
+    protected $retryJobs;
+
     /** @ORM\Column(type = "jms_job_safe_object", name="stackTrace", nullable = true) */
     protected $stackTrace;
 
@@ -124,9 +165,17 @@ abstract class Job
     /** @ORM\Column(type = "integer", name="memoryUsageReal", nullable = true, options = {"unsigned": true}) */
     protected $memoryUsageReal;
 
-    public static function create($command, array $args = array(), $confirmed = true)
+    /**
+     * This may store any entities which are related to this job, and are
+     * managed by Doctrine.
+     *
+     * It is effectively a many-to-any association.
+     */
+    private $relatedEntities;
+
+    public static function create($command, array $args = array(), $confirmed = true, $queue = self::DEFAULT_QUEUE, $priority = self::PRIORITY_DEFAULT)
     {
-        return new static($command, $args, $confirmed);
+        return new self($command, $args, $confirmed, $queue, $priority);
     }
 
     public static function isNonSuccessfulFinalState($state)
@@ -134,11 +183,20 @@ abstract class Job
         return in_array($state, array(self::STATE_CANCELED, self::STATE_FAILED, self::STATE_INCOMPLETE, self::STATE_TERMINATED), true);
     }
 
-    public function __construct($command, array $args = array(), $confirmed = true)
+    public function __construct($command, array $args = array(), $confirmed = true, $queue = self::DEFAULT_QUEUE, $priority = self::PRIORITY_DEFAULT)
     {
+        if (trim($queue) === '') {
+            throw new \InvalidArgumentException('$queue must not be empty.');
+        }
+        if (strlen($queue) > self::MAX_QUEUE_LENGTH) {
+            throw new \InvalidArgumentException(sprintf('The maximum queue length is %d, but got "%s" (%d chars).', self::MAX_QUEUE_LENGTH, $queue, strlen($queue)));
+        }
+
         $this->command = $command;
         $this->args = $args;
         $this->state = $confirmed ? self::STATE_PENDING : self::STATE_NEW;
+        $this->queue = $queue;
+        $this->priority = $priority * -1;
         $this->createdAt = new \DateTime();
         $this->executeAfter = new \DateTime();
         $this->executeAfter = $this->executeAfter->modify('-1 second');
@@ -154,6 +212,7 @@ abstract class Job
         $this->startedAt = null;
         $this->checkedAt = null;
         $this->closedAt = null;
+        $this->workerName = null;
         $this->output = null;
         $this->errorOutput = null;
         $this->exitCode = null;
@@ -161,6 +220,7 @@ abstract class Job
         $this->runtime = null;
         $this->memoryUsage = null;
         $this->memoryUsageReal = null;
+        $this->relatedEntities = new ArrayCollection();
     }
 
     public function getId()
@@ -171,6 +231,26 @@ abstract class Job
     public function getState()
     {
         return $this->state;
+    }
+
+    public function setWorkerName($workerName)
+    {
+        $this->workerName = $workerName;
+    }
+
+    public function getWorkerName()
+    {
+        return $this->workerName;
+    }
+
+    public function getPriority()
+    {
+        return $this->priority * -1;
+    }
+
+    public function isInFinalState()
+    {
+        return ! $this->isNew() && ! $this->isPending() && ! $this->isRunning();
     }
 
     public function isStartable()
@@ -468,6 +548,19 @@ abstract class Job
         return null !== $this->originalJob;
     }
 
+    public function isRetried()
+    {
+        foreach ($this->retryJobs as $job) {
+            /** @var Job $job */
+
+            if ( ! $job->isInFinalState()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public function checked()
     {
         $this->checkedAt = new \DateTime();
@@ -486,6 +579,11 @@ abstract class Job
     public function getStackTrace()
     {
         return $this->stackTrace;
+    }
+
+    public function getQueue()
+    {
+        return $this->queue;
     }
 
     public function isNew()
